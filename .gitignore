@@ -1,6 +1,8 @@
 ckpt/
 data/
 wandb/
+logs/*.out
+logs/*.log
 __pycache__/
 *.pyc
 *.log

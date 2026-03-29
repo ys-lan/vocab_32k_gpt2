@@ -1,1 +1,0 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_configs/ds_stage2.yaml dpo.py
