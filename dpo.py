@@ -1,78 +1,131 @@
-# 0. imports
+"""Direct Preference Optimization (DPO) on top of an SFT checkpoint.
+
+The script expects a JSONL preference dataset where every row contains a
+``question`` together with a preferred (``response_j``) and a rejected
+(``response_k``) completion. Rows are rendered into the same instruction
+template used during SFT so that the policy stays in-distribution.
+
+Example:
+    accelerate launch --config_file configs/accelerate_configs/ds_stage2.yaml dpo.py
+"""
+
 import os
-import torch
-
-from dataclasses import dataclass, field
-from typing import Dict, Optional
-
-from accelerate import Accelerator
-from datasets import Dataset, load_dataset
-from peft import LoraConfig
-from transformers import HfArgumentParser, TrainingArguments, set_seed
-from glob import glob
-from trl import DPOTrainer
 import random
+from dataclasses import dataclass, field
+from glob import glob
+from typing import Optional
 
+import torch
+from datasets import Dataset, load_dataset
+from transformers import HfArgumentParser, TrainingArguments, set_seed
+from trl import DPOTrainer
 
-from models.tokenization_vocab_32k_gpt2 import vocab_32k_gpt2Tokenizer
 from models.configuration_vocab_32k_gpt2 import vocab_32k_gpt2Config
 from models.modeling_vocab_32k_gpt2 import vocab_32k_GPT2LMHeadModel
-# Define and parse arguments.
+from models.tokenization_vocab_32k_gpt2 import vocab_32k_gpt2Tokenizer
+
 
 @dataclass
 class ScriptArguments:
-    """
-    The arguments for the DPO training script.
-    """
+    """Command line arguments for the DPO training script."""
 
-    # data parameters
-    beta: Optional[float] = field(default=0.1, metadata={"help": "the beta parameter for DPO loss"})
+    # Loss
+    beta: Optional[float] = field(
+        default=0.1, metadata={"help": "the beta parameter for DPO loss"}
+    )
 
-    # training parameters
+    # Model / tokenizer
     model_name_or_path: Optional[str] = field(
         default="ckpt/vocab_32k_gpt2_sft4dpo/checkpoint_epoch6",
         metadata={"help": "the location of the SFT model name or path"},
     )
-    learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "optimizer learning rate"})
-    lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "the lr scheduler type"})
-    warmup_steps: Optional[int] = field(default=500, metadata={"help": "the number of warmup steps"})
-    weight_decay: Optional[float] = field(default=0.05, metadata={"help": "the weight decay"})
-    optimizer_type: Optional[str] = field(default="paged_adamw_32bit", metadata={"help": "the optimizer type"})
+    model_config_path: Optional[str] = field(
+        default="configs/model_configs/vocab_32k_gpt2.json",
+        metadata={"help": "path to the model config JSON"},
+    )
+    tokenizer_model_path: Optional[str] = field(
+        default="configs/tokenizer_models/vocab_32k_gpt2.model",
+        metadata={"help": "path to the SentencePiece tokenizer model"},
+    )
+    model_dtype: Optional[str] = field(
+        default="float",
+        metadata={"help": "model_dtype[float16, bfloat16, float] for loading."},
+    )
+    load_in_4bit: Optional[bool] = field(
+        default=False, metadata={"help": "whether to load the model in 4bit"}
+    )
 
-    per_device_train_batch_size: Optional[int] = field(default=8, metadata={"help": "train batch size per device"})
-    per_device_eval_batch_size: Optional[int] = field(default=8, metadata={"help": "eval batch size per device"})
+    # Data
+    train_data_pattern: Optional[str] = field(
+        default="data/DPO/mix_dpo_data.jsonl",
+        metadata={"help": "glob pattern of the preference JSONL shards"},
+    )
+    max_prompt_length: Optional[int] = field(
+        default=512, metadata={"help": "the maximum prompt length"}
+    )
+    max_length: Optional[int] = field(
+        default=1024, metadata={"help": "the maximum sequence length"}
+    )
+    num_proc: Optional[int] = field(
+        default=24, metadata={"help": "processes used to preprocess the raw dataset"}
+    )
+    dataset_num_proc: Optional[int] = field(
+        default=32, metadata={"help": "processes used by DPOTrainer for tokenization"}
+    )
+
+    # Optimization
+    learning_rate: Optional[float] = field(
+        default=5e-4, metadata={"help": "optimizer learning rate"}
+    )
+    lr_scheduler_type: Optional[str] = field(
+        default="cosine", metadata={"help": "the lr scheduler type"}
+    )
+    warmup_steps: Optional[int] = field(
+        default=500, metadata={"help": "the number of warmup steps"}
+    )
+    weight_decay: Optional[float] = field(default=0.05, metadata={"help": "the weight decay"})
+    optimizer_type: Optional[str] = field(
+        default="paged_adamw_32bit", metadata={"help": "the optimizer type"}
+    )
+    per_device_train_batch_size: Optional[int] = field(
+        default=8, metadata={"help": "train batch size per device"}
+    )
+    per_device_eval_batch_size: Optional[int] = field(
+        default=8, metadata={"help": "eval batch size per device"}
+    )
     gradient_accumulation_steps: Optional[int] = field(
         default=5, metadata={"help": "the number of gradient accumulation steps"}
     )
-
     gradient_checkpointing: Optional[bool] = field(
         default=False, metadata={"help": "whether to use gradient checkpointing"}
     )
-
     gradient_checkpointing_use_reentrant: Optional[bool] = field(
-        default=False, metadata={"help": "whether to use reentrant for gradient checkpointing"}
+        default=False,
+        metadata={"help": "whether to use reentrant for gradient checkpointing"},
+    )
+    max_steps: Optional[int] = field(
+        default=50000, metadata={"help": "max number of training steps"}
     )
 
-    lora_alpha: Optional[float] = field(default=16, metadata={"help": "the lora alpha parameter"})
-    lora_dropout: Optional[float] = field(default=0.05, metadata={"help": "the lora dropout parameter"})
+    # LoRA (unused unless a peft_config is passed to the trainer)
+    lora_alpha: Optional[float] = field(
+        default=16, metadata={"help": "the lora alpha parameter"}
+    )
+    lora_dropout: Optional[float] = field(
+        default=0.05, metadata={"help": "the lora dropout parameter"}
+    )
     lora_r: Optional[int] = field(default=8, metadata={"help": "the lora r parameter"})
 
-    max_prompt_length: Optional[int] = field(default=512, metadata={"help": "the maximum prompt length"})
-    max_length: Optional[int] = field(default=1024, metadata={"help": "the maximum sequence length"})
-    max_steps: Optional[int] = field(default=50000, metadata={"help": "max number of training steps"})
+    # Checkpointing / logging
+    output_dir: Optional[str] = field(
+        default="./ckpt/vocab_32k_gpt2_dpo/", metadata={"help": "the output directory"}
+    )
     logging_steps: Optional[int] = field(default=10, metadata={"help": "the logging frequency"})
     save_steps: Optional[int] = field(default=10000, metadata={"help": "the saving frequency"})
-    eval_steps: Optional[int] = field(default=10000, metadata={"help": "the evaluation frequency"})
-
-    output_dir: Optional[str] = field(default="./ckpt/vocab_32k_gpt2_dpo/", metadata={"help": "the output directory"})
-    log_freq: Optional[int] = field(default=1, metadata={"help": "the logging frequency"})
-    load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "whether to load the model in 4bit"})
-    model_dtype: Optional[str] = field(
-        default="float", metadata={"help": "model_dtype[float16, bfloat16, float] for loading."}
+    eval_steps: Optional[int] = field(
+        default=10000, metadata={"help": "the evaluation frequency"}
     )
-
-    # instrumentation
-    sanity_check: Optional[bool] = field(default=False, metadata={"help": "only train on 1000 samples"})
+    log_freq: Optional[int] = field(default=1, metadata={"help": "the logging frequency"})
     report_to: Optional[str] = field(
         default="tensorboard",
         metadata={
@@ -81,7 +134,11 @@ class ScriptArguments:
             'Use `"all"` to report to all integrations installed, `"none"` for no integrations.'
         },
     )
-    # debug argument for distributed training
+
+    # Instrumentation
+    sanity_check: Optional[bool] = field(
+        default=False, metadata={"help": "only train on 1000 samples"}
+    )
     ignore_bias_buffers: Optional[bool] = field(
         default=False,
         metadata={
@@ -90,44 +147,50 @@ class ScriptArguments:
         },
     )
     seed: Optional[int] = field(
-        default=42, metadata={"help": "Random seed that will be set at the beginning of training."}
+        default=42,
+        metadata={"help": "Random seed that will be set at the beginning of training."},
     )
 
-def return_prompt_and_responses(samples) -> Dict[str, str]:
+
+def return_prompt_and_responses(samples) -> dict[str, str]:
+    """Render raw preference rows into the prompt/chosen/rejected schema TRL expects."""
     return {
         "prompt": [
             "### Instruction: " + question + "\n\n### System: \n"
             for question in samples["question"]
         ],
-        "chosen": samples["response_j"], # rated better than k
-        "rejected": samples["response_k"], # rated worse than j
+        "chosen": samples["response_j"],
+        "rejected": samples["response_k"],
     }
+
 
 def get_dataset_paired(
     data_patterns,
     sanity_check: bool = False,
-    num_proc=24,
+    num_proc: int = 24,
 ) -> Dataset:
-    """Load the stack-exchange-paired dataset from Hugging Face and convert it to the necessary format.
+    """Load a paired-preference dataset from JSONL shards.
 
-    The dataset is converted to a dictionary with the following structure:
-    {
-        'question': List[str],
-        'response_j': List[str], # which is better than response_k
-        'response_k': List[str],
-    }
+    Each raw row must have the following structure::
 
-    questions are structured as follows:
-      "### Instruction: \n" + <question> + "\n\n### System: \n"
+        {
+            "question": str,
+            "response_j": str,   # preferred over response_k
+            "response_k": str,
+        }
+
+    Prompts are rendered as ``"### Instruction: " + question + "\\n\\n### System: \\n"``.
     """
     all_data_files = []
-    for name, pattern in data_patterns.items():
+    for _, pattern in data_patterns.items():
         data_files = glob(pattern)
-        assert len(data_files) > 0
+        assert data_files, f"No files matched the data pattern: {pattern}"
         all_data_files.extend(data_files)
     random.shuffle(all_data_files)
 
-    dataset = load_dataset("json", data_files=all_data_files, split='train', streaming=False)
+    dataset = load_dataset(
+        "json", data_files=all_data_files, split="train", streaming=False
+    )
     original_columns = dataset.column_names
 
     if sanity_check:
@@ -141,53 +204,55 @@ def get_dataset_paired(
     )
 
 
-if __name__ == "__main__":
+def resolve_dtype(name: str) -> torch.dtype:
+    return {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float": torch.float,
+    }.get(name, torch.float)
 
 
+def main():
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
 
     set_seed(script_args.seed)
 
-    # 1. load a pretrained model
-    torch_dtype = torch.float
-    if script_args.model_dtype == "float16":
-        torch_dtype = torch.float16
-    elif script_args.model_dtype == "bfloat16":
-        torch_dtype = torch.bfloat16
+    # 1. Tokenizer and policy model, initialised from the SFT checkpoint.
+    tokenizer = vocab_32k_gpt2Tokenizer(
+        vocab_file=script_args.tokenizer_model_path, legacy=False
+    )
+    # TRL pads preference pairs with the EOS token, matching the Hub convention
+    # for models whose tokenizer ships without a dedicated pad token.
+    tokenizer.pad_token = tokenizer.eos_token
 
-    tokenizer = vocab_32k_gpt2Tokenizer(vocab_file="configs/tokenizer_models/vocab_32k_gpt2.model", legacy=False)
-    tokenizer.pad_token = tokenizer.eos_token # I don't konw the reason.Huggingface Hub likes to set like this.
-    model_config = vocab_32k_gpt2Config.from_pretrained("configs/model_configs/vocab_32k_gpt2.json")
+    model_config = vocab_32k_gpt2Config.from_pretrained(script_args.model_config_path)
     model_config.vocab_size = tokenizer.vocab_size
     model_config.pad_token_id = tokenizer.pad_id
+
     model = vocab_32k_GPT2LMHeadModel.from_pretrained(
-        "ckpt/vocab_32k_gpt2_sft4dpo/checkpoint_epoch6", config=model_config, low_cpu_mem_usage=True, torch_dtype=torch_dtype
+        script_args.model_name_or_path,
+        config=model_config,
+        low_cpu_mem_usage=True,
+        torch_dtype=resolve_dtype(script_args.model_dtype),
     )
     model.config.use_cache = False
 
     if script_args.ignore_bias_buffers:
-        # torch distributed hack
+        # Boolean buffers break DDP's gradient bucketing; exclude them explicitly.
         model._ddp_params_and_buffers_to_ignore = [
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
 
-    # 2. Load the Stack-exchange paired dataset
-    data_patterns = {
-        "mix_dpo_dataset": "data/DPO/mix_dpo_data.jsonl",
-    }
+    # 2. Preference dataset. New sources must first be converted to the
+    #    question/response_j/response_k schema documented above.
+    train_dataset = get_dataset_paired(
+        data_patterns={"mix_dpo_dataset": script_args.train_data_pattern},
+        sanity_check=script_args.sanity_check,
+        num_proc=script_args.num_proc,
+    )
 
-    # if add dataset, firstly need to transform to a fixed format and mofify 'get_stack_exchange_paired'
-    train_dataset = get_dataset_paired(data_patterns=data_patterns, sanity_check=script_args.sanity_check)
-
-    # 3. Load evaluation dataset 
-    # eval_dataset = get_stack_exchange_paired(data_dir="data/evaluation", sanity_check=True)
-    # eval_dataset = eval_dataset.filter(
-    #     lambda x: len(x["prompt"]) + len(x["chosen"]) <= script_args.max_length
-    #     and len(x["prompt"]) + len(x["rejected"]) <= script_args.max_length
-    # )
-
-    # 4. initialize training arguments:
+    # 3. Training arguments.
     training_args = TrainingArguments(
         per_device_train_batch_size=script_args.per_device_train_batch_size,
         per_device_eval_batch_size=script_args.per_device_eval_batch_size,
@@ -207,29 +272,14 @@ if __name__ == "__main__":
         bf16=True,
         remove_unused_columns=False,
         run_name="vocab_32k_gpt2_dpo",
-        gradient_checkpointing_kwargs=dict(use_reentrant=script_args.gradient_checkpointing_use_reentrant),
+        gradient_checkpointing_kwargs=dict(
+            use_reentrant=script_args.gradient_checkpointing_use_reentrant
+        ),
         seed=script_args.seed,
     )
 
-    # If use lora
-    # peft_config = LoraConfig(
-    #     r=script_args.lora_r,
-    #     lora_alpha=script_args.lora_alpha,
-    #     lora_dropout=script_args.lora_dropout,
-    #     target_modules=[
-    #         "q_proj",
-    #         "v_proj",
-    #         "k_proj",
-    #         "out_proj",
-    #         "fc_in",
-    #         "fc_out",
-    #         "wte",
-    #     ],
-    #     bias="none",
-    #     task_type="CAUSAL_LM",
-    # )
-
-    # 5. initialize the DPO trainer
+    # 4. DPO trainer. ref_model=None makes TRL use the frozen initial policy as
+    #    the reference, which halves memory compared to a second model copy.
     dpo_trainer = DPOTrainer(
         model,
         ref_model=None,
@@ -239,13 +289,16 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         max_prompt_length=script_args.max_prompt_length,
         max_length=script_args.max_length,
-        dataset_num_proc=32
+        dataset_num_proc=script_args.dataset_num_proc,
     )
 
-    # 6. train
+    # 5. Train and export.
     dpo_trainer.train()
     dpo_trainer.save_model(script_args.output_dir)
+    dpo_trainer.model.save_pretrained(
+        os.path.join(script_args.output_dir, "final_checkpoint")
+    )
 
-    # 7. save
-    output_dir = os.path.join(script_args.output_dir, "final_checkpoint")
-    dpo_trainer.model.save_pretrained(output_dir)
+
+if __name__ == "__main__":
+    main()

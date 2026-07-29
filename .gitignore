@@ -1,10 +1,38 @@
+# Checkpoints, datasets and run artifacts
 ckpt/
 data/
 wandb/
+runs/
+outputs/
 logs/*.out
 logs/*.log
-__pycache__/
-*.pyc
-*.log
+
+# Model weights and serialised tensors
 *.bin
+*.pt
+*.pth
+*.safetensors
+
+# Raw corpora
 *.jsonl
+*.jsonl.zst
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Logs and OS noise
+*.log
+.DS_Store

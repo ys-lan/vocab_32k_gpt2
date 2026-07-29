@@ -5,7 +5,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Test File",
+            "name": "Python: Current File",
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
@@ -13,7 +13,24 @@
             "justMyCode": true
         },
         {
-            "name": "Python: Current File",
+            "name": "Pretrain (accelerate + DeepSpeed ZeRO-2)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "args": [
+                "--config_file",
+                "configs/accelerate_configs/ds_stage2.yaml",
+                "train.py",
+                "--train_config",
+                "configs/pretrain_config.yaml",
+                "--model_config",
+                "configs/model_configs/vocab_32k_gpt2.json"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "SFT (accelerate + DeepSpeed ZeRO-2)",
             "type": "debugpy",
             "request": "launch",
             "module": "accelerate.commands.launch",
@@ -24,19 +41,20 @@
                 "--train_config",
                 "configs/instruct_config.yaml",
                 "--model_config",
-                "configs/model_configs/vocab_32k_gpt2.json",
+                "configs/model_configs/vocab_32k_gpt2.json"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "Python: DPO File",
+            "name": "DPO (accelerate + DeepSpeed ZeRO-2)",
             "type": "debugpy",
             "request": "launch",
             "module": "accelerate.commands.launch",
             "args": [
-                "--config_file", "configs/accelerate_configs/ds_stage2.yaml",
-                "dpo.py",
+                "--config_file",
+                "configs/accelerate_configs/ds_stage2.yaml",
+                "dpo.py"
             ],
             "console": "integratedTerminal",
             "justMyCode": false

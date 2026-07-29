@@ -1,6 +1,18 @@
+"""ARCHIVED -- superseded by :mod:`dataset.dataset`; kept for reference only.
+
+This is the non-streaming ancestor of the active pipeline. It differs in two
+ways: shards are loaded eagerly (``streaming=False``) and the instruction branch
+calls ``set_format(type="torch")`` before deriving labels. Nothing in the current
+training path imports this module.
+
+The commented-out branches in :func:`pretrain_transform` document how the
+original corpora (WuDao, RedPajama, Baidu Baike, news, lyrics, classical poetry,
+couplets) were normalised onto a single ``text`` column; they are a useful
+starting point when onboarding a new corpus.
+
+Adapted from the Open-Llama project (``dataset/dataset.py``).
 """
-FilePath: /Open-Llama/dataset/dataset.py
-"""
+
 import math
 import torch
 import random
@@ -13,19 +25,18 @@ random.seed(42)
 
 
 def pretrain_transform(batch):
-    #SkyPile-150B and OpenWebtext
-
-    if("text") in batch:
+    # SkyPile-150B and OpenWebText already expose a "text" column.
+    if ("text") in batch:
         pass
     return batch
-    # wudao preprocess
+    # WuDao: title + body.
     # if "uniqueKey" in batch:
     #     assert len(batch["title"]) == 1
-    #     batch["text"] = [batch["title"][0] + "\n" + batch["content"][0]]    
-    # #pajama preprocess a
+    #     batch["text"] = [batch["title"][0] + "\n" + batch["content"][0]]
+    # RedPajama: already normalised.
     # elif "text" in batch and "meta" in batch:
     #     pass
-    # #baike preprocess
+    # Baidu Baike: title + main content, with a constant fallback.
     # elif "basic_info" in batch and "main_content" in batch:
     #     title = ""
     #     main_content = ""
@@ -36,8 +47,8 @@ def pretrain_transform(batch):
     #     if title or main_content:
     #         batch["text"] = [title + "\n" + main_content]
     #     else:
-    #         batch["text"] =["百度百科"]
-    # #pnews preprocess
+    #         batch["text"] = ["Encyclopedia"]
+    # News: title + body, with a constant fallback.
     # elif "channel" in batch and "type" in batch:
     #         title = ""
     #         text = ""
@@ -47,20 +58,20 @@ def pretrain_transform(batch):
     #             text = batch["text"][0]
     #         if title or text:
     #             del batch["text"]
-    #             batch["text"] =[title + "\n" + text]
+    #             batch["text"] = [title + "\n" + text]
     #         else:
-    #             batch["text"] =["新闻"]
-    # #plyrics preprocess
+    #             batch["text"] = ["News"]
+    # Song lyrics: title + lyrics.
     # elif "singer" in batch:
     #     text = batch["text"][0]
     #     del batch["text"]
     #     batch["text"] = [batch["title"][0] + "\n" + text]
-    # #pshici preprocess
+    # Classical poetry: title + poem.
     # elif "author" in batch:
     #     text = batch["text"][0]
     #     del batch["text"]
     #     batch["text"] = [batch["title"][0] + "\n" + text]
-    # #pcouplets preprocess
+    # Couplets: already normalised.
     # elif "text" in batch and "type" in batch:
     #     pass
     # else:
@@ -213,7 +224,8 @@ def construct_dataset(
         assert len(data_files) > 0
         all_data_files.extend(data_files)
     random.shuffle(all_data_files)
-    # 当shard可以被world_size整除时 split_dataset_by_node 会直接按shard进行划分，否则会读所有数据然后跳过一部分，可能会慢一点
+    # When the shard count divides the world size, `split_dataset_by_node` splits
+    # by shard; otherwise every rank reads everything and discards most of it.
     # https://huggingface.co/docs/datasets/package_reference/main_classes#datasets.distributed.split_dataset_by_node
     if world_size is not None:
         num_shards = len(all_data_files)
@@ -223,7 +235,7 @@ def construct_dataset(
     )
     # shuffle
     dataset = dataset.shuffle(seed=42)
-    # 文本预处理转换为统一格式
+    # Normalise heterogeneous records onto a single schema.
     if dataset_config["mode"] == "pretrain":
         dataset = dataset.map(pretrain_transform, batched=True, batch_size=1)
     elif dataset_config["mode"] == "instruct":

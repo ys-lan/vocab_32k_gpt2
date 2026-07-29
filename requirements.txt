@@ -1,20 +1,25 @@
+# Install PyTorch first, matching your CUDA runtime, e.g. for CUDA 11.8:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
 torch
-torchvision
-torchaudio
-zstandard
-accelerate==0.26.1
-datasets
-wandb
-deepspeed==0.13.1
-absl-py
-torchinfo
-scikit-learn
-matplotlib
-seaborn
-sentencepiece
-triton
-functorch
-xformers
-gradio
-peft
+
+# Modelling, training and alignment stack.
 transformers
+accelerate==0.26.1
+deepspeed==0.13.1
+trl
+peft
+datasets
+sentencepiece
+
+# Configuration and experiment tracking.
+pyyaml
+absl-py
+wandb
+
+# Model introspection (Trainer.get_model_info).
+torchinfo
+
+# Optional extras, useful but not imported by the training path:
+#   xformers        memory-efficient attention kernels
+#   zstandard       reading .jsonl.zst corpora
+#   matplotlib      plotting training curves offline

@@ -1,100 +1,158 @@
+"""Unified training entrypoint for pretraining and supervised fine-tuning (SFT).
+
+The training stage is selected by ``data.mode`` inside the training config:
+
+* ``pretrain``  -- causal language modelling on raw text corpora.
+* ``instruct``  -- supervised fine-tuning on instruction/response pairs.
+
+Example:
+    accelerate launch --config_file configs/accelerate_configs/ds_stage2.yaml \\
+        train.py \\
+        --train_config configs/pretrain_config.yaml \\
+        --model_config configs/model_configs/vocab_32k_gpt2.json
+
+Adapted from the Open-Llama project (``train_lm.py``).
 """
-copy from: /Open-Llama/train_lm.py
-"""
-import yaml
-import math
+
 import logging
-from absl import app
-from absl import flags
+
+import yaml
+from absl import app, flags
 from accelerate import Accelerator
-from torch.utils.data import DataLoader
-from peft import LoraConfig, TaskType, get_peft_model
 from datasets.distributed import split_dataset_by_node
-from models.tokenization_vocab_32k_gpt2 import vocab_32k_gpt2Tokenizer
-#from transformers import AutoConfig, AutoModelForCausalLM
-from models.configuration_vocab_32k_gpt2 import vocab_32k_gpt2Config
-from models.modeling_vocab_32k_gpt2 import vocab_32k_GPT2LMHeadModel 
+from peft import LoraConfig, TaskType, get_peft_model
+from torch.utils.data import DataLoader
+
 from dataset.dataset import construct_dataset
+from models.configuration_vocab_32k_gpt2 import vocab_32k_gpt2Config
+from models.modeling_vocab_32k_gpt2 import vocab_32k_GPT2LMHeadModel
+from models.tokenization_vocab_32k_gpt2 import vocab_32k_gpt2Tokenizer
 from trainer import Trainer
-import os 
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string("train_config", None, "Training config path")
-flags.DEFINE_string("model_config", None, "Model config path")
+flags.DEFINE_string("train_config", None, "Path to the training config (YAML).")
+flags.DEFINE_string("model_config", None, "Path to the model config (JSON).")
+flags.mark_flags_as_required(["train_config", "model_config"])
+
+logging.basicConfig(
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
-def main(argv):
-    with open(FLAGS.train_config, "r", encoding="utf-8") as fp:
-        config = yaml.load(fp, Loader=yaml.FullLoader)
-    data_config = config["data"]
-    
-    accelerator = Accelerator(
-        gradient_accumulation_steps=config["train"].get("gradient_accumulation_steps", 1)
+def build_tokenizer(data_config):
+    return vocab_32k_gpt2Tokenizer(
+        vocab_file=data_config["tokenizer_model_path"], legacy=False
     )
-    tokenizer = vocab_32k_gpt2Tokenizer(vocab_file=data_config["tokenizer_model_path"], legacy=False)
+
+
+def build_dataloader(config, tokenizer, accelerator):
+    """Build a sharded, streaming dataloader for the current process."""
+    data_config = config["data"]
+    train_config = config["train"]
+
     if data_config.get("split_by_shard", False):
         train_dataset = construct_dataset(
             data_config, tokenizer, world_size=accelerator.num_processes
         )
     else:
         train_dataset = construct_dataset(data_config, tokenizer)
+
     train_dataset = split_dataset_by_node(
         train_dataset,
         rank=accelerator.process_index,
         world_size=accelerator.num_processes,
     )
-    train_loader = DataLoader(
+    return DataLoader(
         train_dataset,
-        batch_size=config["train"]["train_batch_size"],
-        num_workers=config["train"]["train_num_workers_4_dataloader"],
-        prefetch_factor=config["train"].get("prefetch_factor", 2),
+        batch_size=train_config["train_batch_size"],
+        num_workers=train_config["train_num_workers_4_dataloader"],
+        prefetch_factor=train_config.get("prefetch_factor", 2),
         pin_memory=True,
     )
-    vocab_size = tokenizer.vocab_size
+
+
+def build_model(config, tokenizer):
+    """Instantiate the model, optionally resuming from a Hugging Face checkpoint.
+
+    Note:
+        Under ZeRO-3, parameter partitioning only takes effect for models built
+        inside ``deepspeed.zero.Init()``. The ``Auto*`` classes enter that context
+        for you; the concrete class used here does not, so every rank may
+        materialise the full weights. Register this architecture with
+        ``AutoModelForCausalLM`` before relying on ZeRO-3 for memory savings.
+        See huggingface/accelerate#932.
+    """
     model_config = vocab_32k_gpt2Config.from_pretrained(FLAGS.model_config)
-    model_config.vocab_size = vocab_size
+    model_config.vocab_size = tokenizer.vocab_size
     model_config.pad_token_id = tokenizer.pad_id
-    # 使用AutoModel可以在Deepspeed.zero.Init()下正确的生效，而直接使用如OpenLlamaModel不能正确生效，导致浪费大量内存空间
-    # https://github.com/huggingface/accelerate/pull/932
-    if config["train"]["ckpt"] is not None:
-        raw_model = vocab_32k_GPT2LMHeadModel.from_pretrained(
-            config["train"]["ckpt"], config=model_config
-        )
-        logging.warning("Loaded ckpt from: {}".format(config["train"]["ckpt"]))
+
+    ckpt = config["train"].get("ckpt")
+    if ckpt is not None:
+        model = vocab_32k_GPT2LMHeadModel.from_pretrained(ckpt, config=model_config)
+        logger.info("Loaded checkpoint from: %s", ckpt)
     else:
-        raw_model = vocab_32k_GPT2LMHeadModel(config=model_config)
-    
-    total_params = sum(param.numel() for param in raw_model.parameters())
-    logging.warning("#parameters: {}".format(total_params))
-    # lora
-    if config["train"].get("use_lora", False):
-        # gradient ckpt bug, https://github.com/huggingface/transformers/issues/23170
-        if hasattr(raw_model, "enable_input_require_grads"):
-            raw_model.enable_input_require_grads()
-        else:
+        model = vocab_32k_GPT2LMHeadModel(config=model_config)
+        logger.info("Initialised model from scratch.")
 
-            def make_inputs_require_grad(module, input, output):
-                output.requires_grad_(True)
+    logger.info(
+        "Model parameters: %.2fM", sum(p.numel() for p in model.parameters()) / 1e6
+    )
+    return model
 
-            raw_model.get_input_embeddings().register_forward_hook(
-                make_inputs_require_grad
-            )
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            target_modules=["q_proj", "v_proj"],
-            inference_mode=False,
-            r=1,
-            lora_alpha=32,
-            lora_dropout=0.1,
+
+def apply_lora(model):
+    """Wrap the model with LoRA adapters.
+
+    ``enable_input_require_grads`` keeps gradient checkpointing compatible with
+    frozen embeddings, see huggingface/transformers#23170.
+    """
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+
+        def make_inputs_require_grad(module, module_input, module_output):
+            module_output.requires_grad_(True)
+
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=["q_proj", "v_proj"],
+        inference_mode=False,
+        r=1,
+        lora_alpha=32,
+        lora_dropout=0.1,
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+    return model
+
+
+def main(argv):
+    del argv  # Handled by absl.
+
+    with open(FLAGS.train_config, encoding="utf-8") as fp:
+        config = yaml.load(fp, Loader=yaml.FullLoader)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config["train"].get(
+            "gradient_accumulation_steps", 1
         )
-        raw_model = get_peft_model(raw_model, peft_config)
-        raw_model.print_trainable_parameters()
+    )
+
+    tokenizer = build_tokenizer(config["data"])
+    train_loader = build_dataloader(config, tokenizer, accelerator)
+    raw_model = build_model(config, tokenizer)
+
+    if config["train"].get("use_lora", False):
+        raw_model = apply_lora(raw_model)
     if config["train"].get("gradient_checkpointing_enable", False):
         raw_model.gradient_checkpointing_enable()
-    trainer = Trainer(config, raw_model, train_loader, tokenizer, accelerator)
 
-    # for batch in train_loader:
-    #     print(batch)
+    trainer = Trainer(config, raw_model, train_loader, tokenizer, accelerator)
     trainer.train()
 
 

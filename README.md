@@ -1,275 +1,360 @@
-# 🤖 vocab_32k_gpt2
+<div align="center">
 
-一个从零开始训练的 32K 词表 GPT2 项目，包含完整的三阶段流程：
+# vocab_32k_gpt2
 
-1. 预训练（Pretrain）
-2. 指令微调（SFT）
-3. 偏好优化（DPO）
+**A compact, end-to-end recipe for training a GPT-2 class language model from scratch — pretraining, supervised fine-tuning, and preference alignment.**
 
-本仓库作为本科毕业设计实践，基于 PyTorch + Hugging Face Transformers + Accelerate + DeepSpeed 实现，支持多卡训练与断点续训。
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
+[![Transformers](https://img.shields.io/badge/%F0%9F%A4%97%20Transformers-integrated-yellow.svg)](https://github.com/huggingface/transformers)
+[![DeepSpeed](https://img.shields.io/badge/DeepSpeed-ZeRO%201%2F2%2F3-3a7bd5.svg)](https://github.com/microsoft/DeepSpeed)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
-## ✨ 1. 项目特点
+</div>
 
-- 自定义 `vocab_32k_gpt2` 模型与 tokenizer（SentencePiece 32K 词表）
-- 统一训练入口：`train.py` + `trainer.py`
-- 支持两类训练模式：`pretrain`、`instruct`
-- 支持 DPO 对齐训练：`dpo.py`
-- 使用 `accelerate + deepspeed` 进行分布式训练
-- 支持 checkpoint 自动恢复（通过 `accelerator.load_state(work_dir)`）
+---
 
-## 🗂️ 2. 仓库结构
+## Overview
+
+`vocab_32k_gpt2` is a GPT-2 architecture (≈110M parameters, weight-tied) paired with a custom
+32K SentencePiece vocabulary, trained from random initialisation through the full modern
+alignment pipeline. It is deliberately small: every stage fits on a handful of consumer or
+workstation GPUs, which makes it a practical reference for understanding how a production
+LLM pipeline is wired together end to end.
+
+```mermaid
+flowchart LR
+    A[Raw corpora<br/>SkyPile-150B · OpenWebText] --> B[1 · Pretrain<br/>train.py]
+    B --> C[2 · SFT<br/>train.py]
+    C --> D[3 · SFT for DPO<br/>train.py]
+    D --> E[4 · DPO<br/>dpo.py]
+    E --> F[Aligned model]
+```
+
+| Stage | Entrypoint | Config | Output |
+| :--- | :--- | :--- | :--- |
+| 1 · Pretrain | `train.py` | `configs/pretrain_config.yaml` | `ckpt/vocab_32k_gpt2` |
+| 2 · SFT | `train.py` | `configs/instruct_config.yaml` | `ckpt/vocab_32k_gpt2_instruction` |
+| 3 · SFT for DPO | `train.py` | `configs/dpo_instruct_config.yaml` | `ckpt/vocab_32k_gpt2_sft4dpo` |
+| 4 · DPO | `dpo.py` | CLI flags (`ScriptArguments`) | `ckpt/vocab_32k_gpt2_dpo` |
+
+### Highlights
+
+- **One entrypoint for pretraining and SFT.** `train.py` switches behaviour on `data.mode`,
+  so both stages share the same dataloader, optimizer, scheduler and checkpoint logic.
+- **Streaming data pipeline.** Corpora are consumed lazily via `datasets` iterable datasets
+  and sharded across ranks, so dataset size is bounded by disk, not by RAM.
+- **Sequence packing.** Documents can be sampled, split or concatenated into full-length
+  sequences, which removes nearly all padding waste during pretraining.
+- **Prompt masking for SFT.** Instruction tokens are set to `-100` so the loss is computed on
+  responses only, including for multi-turn conversations.
+- **Distributed by default.** `accelerate` + DeepSpeed ZeRO stages 1/2/3 (with optional CPU
+  offload), bf16 mixed precision, gradient checkpointing and optional LoRA adapters.
+- **Resumable.** Training state is checkpointed periodically and the dataloader is
+  fast-forwarded on restart so batches are not replayed.
+
+---
+
+## Quickstart
+
+### 1. Environment
+
+Requires Python 3.10+, a CUDA 11.8+ toolchain matching your PyTorch build, and Linux or WSL2
+(the launch scripts are Bash).
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+```
+
+### 2. Verify the tokenizer
+
+```bash
+python utils/spm_to_hf_tokenizer.py --vocab_file configs/tokenizer_models/vocab_32k_gpt2.model
+```
+
+This prints the vocabulary size and special-token ids, then checks that a few bilingual
+probes round-trip through encode/decode.
+
+### 3. Prepare data
+
+Place JSONL shards under `data/` and point the `data.data` section of a config at them. See
+[Data formats](#data-formats) for the expected schema of each stage.
+
+### 4. Train
+
+```bash
+bash scripts/launch/pre_train.sh    # 1 · pretrain
+bash scripts/launch/sft.sh          # 2 · supervised fine-tuning
+bash scripts/launch/sft4dpo.sh      # 3 · SFT on the preference prompts
+bash scripts/launch/dpo.sh          # 4 · DPO
+```
+
+Every launch script reads its settings from the environment, so a run can be retargeted
+without editing files:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+ACCELERATE_CONFIG=configs/accelerate_configs/ds_stage3.yaml \
+  bash scripts/launch/pre_train.sh
+```
+
+### 5. Sample from a checkpoint
+
+```bash
+python scripts/eval/generate.py --checkpoint ckpt/vocab_32k_gpt2
+python scripts/eval/generate.py \
+  --checkpoint ckpt/vocab_32k_gpt2_instruction/checkpoint_epoch4 --prompt_set sft
+```
+
+---
+
+## Model and tokenizer
+
+The model is a standard GPT-2 decoder re-exported under a project-local class name so that
+checkpoints stay self-describing.
+
+| Property | Value |
+| :--- | :--- |
+| Layers / heads / hidden size | 12 / 12 / 768 |
+| Context length | 1024 |
+| Vocabulary | 32,000 (SentencePiece) |
+| Parameters | ≈110M, `lm_head` tied to `wte` |
+| Activation | `gelu_new` |
+| `bos` / `eos` / `pad` token ids | 1 / 2 / 3 |
+
+- Tokenizer model: `configs/tokenizer_models/vocab_32k_gpt2.model`
+- Architecture overrides: `configs/model_configs/vocab_32k_gpt2.json`
+- Defaults live in `models/configuration_vocab_32k_gpt2.py`
+
+The tokenizer is instantiated with `legacy=False`, which disables SentencePiece's dummy
+prefix so that a leading space is never silently inserted. `vocab_size` and `pad_token_id`
+are overwritten from the loaded tokenizer at startup, so the tokenizer file is the single
+source of truth.
+
+---
+
+## Data formats
+
+All stages read newline-delimited JSON. The `data.data` block maps an arbitrary source name
+to a glob pattern; every match is shuffled into one stream, so mixing corpora is a matter of
+adding entries.
+
+```yaml
+data:
+  data:
+    sky-pile150B: "data/SkyPile-150B/rawdata/2020-40_zh_*.jsonl"
+    openwebtext: "data/openwebtext/openwebtext.jsonl"
+```
+
+### Pretraining (`mode: pretrain`)
+
+One document per line, under a `text` key:
+
+```json
+{"text": "Sequence modelling with transformers begins with ..."}
+```
+
+Corpora that store content under different keys need a branch in `pretrain_transform`
+(`dataset/dataset.py`); the archived `dataset/legacy/sft_dataset.py` contains worked examples
+for title/body corpora.
+
+### Instruction tuning (`mode: instruct`)
+
+`instruction` and `output` are required; `input` and `history` may be empty. `history` holds
+`[user, assistant]` pairs and is expanded into one training example per turn.
+
+```json
+{"instruction": "Explain gradient accumulation.", "input": "", "output": "It splits a large batch ...", "history": []}
+{"instruction": "And for ZeRO-3?", "input": "", "output": "Parameters are sharded ...", "history": [["Explain gradient accumulation.", "It splits a large batch ..."]]}
+```
+
+Examples are rendered with the project template and only the response contributes to the
+loss:
+
+```text
+### Instruction:
+{instruction}
+
+### Input:          # omitted when `input` is empty
+{input}
+
+### System:
+{output}</s>
+```
+
+### Preference data (DPO)
+
+`response_j` is the preferred completion, `response_k` the rejected one:
+
+```json
+{"question": "How should I start learning deep learning?", "response_j": "Begin with linear algebra and Python ...", "response_k": "No idea."}
+```
+
+---
+
+## Configuration reference
+
+### Data section
+
+| Key | Description |
+| :--- | :--- |
+| `mode` | `pretrain` or `instruct`; selects the normalisation branch. |
+| `data` | Mapping of source name to glob pattern. |
+| `seq_length` | Tokens per training sequence. |
+| `tokenizer_model_path` | Path to the SentencePiece model. |
+| `pad_to_max` | Pad every example to `seq_length` at tokenisation time. |
+| `sequence_sample_mode` | `truncation`, `none`, `sample` (random crop) or `split` (consecutive chunks). |
+| `concat_multiple_sequence` | Pack several documents into full-length sequences. |
+| `num_sequences` | Documents fused per packed batch when packing is enabled. |
+| `split_by_shard` | Truncate the shard list to a multiple of the world size so ranks split by file. |
+
+### Train section
+
+| Key | Description |
+| :--- | :--- |
+| `train_batch_size` | Micro-batch size **per process**. |
+| `gradient_accumulation_steps` | Micro-batches per optimizer step. Keep in sync with the accelerate config. |
+| `num_training_steps` | Cap on micro-batches consumed per process; also scales the cosine schedule. |
+| `num_warmup_steps` | Linear warmup length. |
+| `lr` / `weight_decay` | FusedAdam hyperparameters (`betas=(0.9, 0.95)`); biases and norms are excluded from decay. |
+| `ckpt` | Hugging Face checkpoint to initialise from, or empty to train from scratch. |
+| `train_num_workers_4_dataloader` / `prefetch_factor` | Dataloader throughput knobs. |
+| `train_and_eval` | Sample from the validation prompts during training. |
+| `gradient_checkpointing_enable` | Trade compute for activation memory. |
+| `use_lora` | Attach LoRA adapters (`r=1`, `alpha=32`) to `q_proj`/`v_proj`. |
+
+### Run section
+
+| Key | Description |
+| :--- | :--- |
+| `log_interval` / `eval_interval` / `save_interval` | Intervals in optimizer steps. |
+| `work_dir` | Directory for checkpoints and resume state. |
+| `project_name` | Weights & Biases project name. |
+
+> **Effective batch size** = `train_batch_size` × `gradient_accumulation_steps` × number of
+> processes. `gradient_accumulation_steps` appears in both the training config and
+> `configs/accelerate_configs/ds_stage2.yaml`; a mismatch silently changes the schedule.
+
+### Distributed configs
+
+| File | ZeRO stage | Notes |
+| :--- | :--- | :--- |
+| `ds_stage1.yaml` | 1 | Optimizer state sharding. |
+| `ds_stage2.yaml` | 2 | Default for all launch scripts; also shards gradients. |
+| `ds_stage3.yaml` | 3 | Parameter sharding; use when weights no longer fit. |
+| `ds_stage3_offload.yaml` | 3 + CPU offload | Last resort for tight VRAM budgets. |
+| `default_config.yaml` | 1 | Plain 8-process baseline, no per-run port pinning. |
+
+All configs use bf16. Set `num_processes` to match the number of visible devices, and give
+concurrent runs distinct `main_process_port` values.
+
+---
+
+## Checkpointing, logging and evaluation
+
+**Checkpointing.** `Trainer` calls `accelerator.save_state` every `save_interval` optimizer
+steps, writing to `work_dir/checkpoint_epoch{N}`. On startup it calls
+`accelerator.load_state(work_dir)`; if state is found, the global step is recovered from the
+scheduler and the dataloader is fast-forwarded past the batches already consumed.
+
+> **Caveat:** saves land in `work_dir/checkpoint_epoch{N}` while the resume path reads
+> `work_dir` itself. To resume from a specific checkpoint, point `work_dir` at that
+> subdirectory (or copy its contents one level up). A missing checkpoint is not an error —
+> training simply starts from scratch, so check the startup log line before assuming a run
+> resumed.
+
+**Logging.** Metrics (loss, learning rate, loss scale, tokens/second/GPU, step and epoch
+counters) go to Weights & Biases from the main process only. `WANDB_MODE` defaults to
+`offline` so training never blocks on network access; export `WANDB_MODE=online` together
+with your own `WANDB_API_KEY` to stream results.
+
+**Evaluation.** `scripts/eval/generate.py` samples completions for the probe prompts in
+`dataset/validation.py`. Use `--prompt_set pretrain` for raw continuations and
+`--prompt_set sft` for prompts pre-rendered with the instruction template. Decoding can be
+tuned with `--greedy`, `--temperature`, `--top_p`, `--repetition_penalty` and
+`--max_new_tokens`. Pass `--from_zero_checkpoint` to consolidate a DeepSpeed ZeRO state
+directory into fp32 weights before sampling.
+
+---
+
+## Repository layout
 
 ```text
 .
-├── train.py                         # 预训练 / SFT 统一训练入口
-├── trainer.py                       # 训练循环、日志、保存与恢复
-├── dpo.py                           # DPO 训练脚本（TRL DPOTrainer）
-├── requirements.txt                 # Python 依赖
-├── logs/
-│   └── pretrain_log.out             # 训练日志归档
-├── docs/
-│   └── STRUCTURE.md                 # 仓库结构与约定说明
-├── scripts/
-│   ├── launch/
-│   │   ├── pre_train.sh             # 预训练启动命令
-│   │   ├── sft.sh                   # SFT 启动命令
-│   │   ├── sft4dpo.sh               # DPO 前的 SFT 启动命令
-│   │   └── dpo.sh                   # DPO 启动命令
-│   └── eval/
-│       ├── test_base_ckpt.py        # 基座模型推理测试
-│       └── test_sft_ckpt.py         # SFT 模型推理测试
+├── train.py                          # Pretraining / SFT entrypoint (mode-driven)
+├── trainer.py                        # Training loop, logging, checkpointing, resume
+├── dpo.py                            # DPO training via TRL's DPOTrainer
+├── requirements.txt
+├── pyproject.toml                    # Ruff / Black configuration
 ├── configs/
-│   ├── pretrain_config.yaml         # 预训练配置
-│   ├── instruct_config.yaml         # SFT 配置
-│   ├── dpo_instruct_config.yaml     # DPO 前 SFT 配置
-│   ├── model_configs/vocab_32k_gpt2.json
-│   └── accelerate_configs/*.yaml    # DeepSpeed/Accelerate 配置
+│   ├── pretrain_config.yaml
+│   ├── instruct_config.yaml
+│   ├── dpo_instruct_config.yaml
+│   ├── model_configs/                # Architecture overrides
+│   ├── tokenizer_models/             # SentencePiece model and vocabulary
+│   └── accelerate_configs/           # Accelerate + DeepSpeed ZeRO presets
 ├── dataset/
-│   ├── dataset.py                   # 数据读取与预处理（pretrain/instruct）
-│   ├── data_iter.py                 # 可迭代数据集工具
-│   ├── validation.py                # 训练期间验证样例
-│   └── legacy/
-│       └── sft_dataset.py           # 历史版本数据处理脚本（归档）
+│   ├── dataset.py                    # Streaming pipeline for both training modes
+│   ├── data_iter.py                  # Standalone sharded JSONL reader
+│   ├── validation.py                 # Fixed probe prompts
+│   └── legacy/                       # Archived, non-streaming ancestor
 ├── models/
 │   ├── configuration_vocab_32k_gpt2.py
 │   ├── modeling_vocab_32k_gpt2.py
 │   └── tokenization_vocab_32k_gpt2.py
-└── utils/
-    └── spm_to_hf_tknizer.py
+├── scripts/
+│   ├── launch/                       # pre_train.sh · sft.sh · sft4dpo.sh · dpo.sh
+│   └── eval/generate.py              # Sampling / smoke-test CLI
+├── utils/
+│   └── spm_to_hf_tokenizer.py        # Tokenizer verification and HF export
+└── docs/
+    └── STRUCTURE.md                  # Layout conventions and operating rules
 ```
 
-## ⚙️ 3. 环境准备
-
-### 🐍 3.1 Python 与 CUDA
-
-建议环境：
-
-- Python 3.10+
-- CUDA 11.8+（按你的 PyTorch 版本匹配）
-- Linux 或 WSL2（`.sh` 脚本默认是 Linux 风格）
-
-### 📦 3.2 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-`dpo.py` 使用了 `trl.DPOTrainer`，如果你的环境未安装 `trl`，请额外安装：
-
-```bash
-pip install trl
-```
-
-## 🧠 4. 模型与分词器说明
-
-- 词表：`configs/tokenizer_models/vocab_32k_gpt2.model`（SentencePiece 32K）
-- 模型配置：`configs/model_configs/vocab_32k_gpt2.json`
-- `models/configuration_vocab_32k_gpt2.py` 默认结构与 GPT2-base 接近：
-  - `n_layer=12`
-  - `n_head=12`
-  - `n_embd=768`
-  - `n_positions=1024`
-
-Token ID（配置文件中）：
-
-- `bos_token_id = 1`
-- `eos_token_id = 2`
-- `pad_token_id = 3`
-- `vocab_size = 32000`
-
-## 🧾 5. 数据格式
-
-本项目的数据入口由 `dataset/dataset.py` 控制，按 `config.data.mode` 分两类。
-
-### 📚 5.1 预训练数据（`mode: pretrain`）
-
-配置示例见 `configs/pretrain_config.yaml`：
-
-- `data/SkyPile-150B/rawdata/2020-40_zh_*.jsonl`
-- `data/openwebtext/openwebtext.jsonl`
-
-当前预处理函数 `pretrain_transform` 默认使用字段 `text`，因此单条样本至少应包含：
-
-```json
-{"text": "你的预训练文本"}
-```
-
-### 🧑‍🏫 5.2 指令数据（`mode: instruct`）
-
-配置示例见：
-
-- `configs/instruct_config.yaml`（`data/sft_merge.jsonl`）
-- `configs/dpo_instruct_config.yaml`（`data/DPO/mix_dpo_data4sft.jsonl`）
-
-`instruct_transform` 依赖字段：
-
-- `instruction`（必需）
-- `output`（必需）
-- `input`（可为空字符串）
-- `history`（可为空列表）
-
-推荐 JSONL 样例：
-
-```json
-{"instruction": "介绍一下你自己", "input": "", "output": "我是一个语言模型...", "history": []}
-```
-
-### ⚖️ 5.3 DPO 数据
-
-`dpo.py` 读取：`data/DPO/mix_dpo_data.jsonl`
-
-每条样本需要包含：
-
-- `question`
-- `response_j`（偏好更优）
-- `response_k`（偏好较差）
-
-样例：
-
-```json
-{"question": "如何学习深度学习？", "response_j": "建议先学线代和Python...", "response_k": "不知道"}
-```
-
-## 🚀 6. 训练流程（推荐）
-
-建议顺序：Pretrain -> SFT -> SFT-for-DPO -> DPO
-
-### 6.1 🔥 预训练
-
-```bash
-bash scripts/launch/pre_train.sh
-```
-
-等价核心命令：
-
-```bash
-CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 \
-accelerate launch \
-  --config_file configs/accelerate_configs/ds_stage2.yaml \
-  train.py \
-  --train_config configs/pretrain_config.yaml \
-  --model_config configs/model_configs/vocab_32k_gpt2.json
-```
-
-输出目录（默认）：`ckpt/vocab_32k_gpt2`
-
-### 6.2 🛠️ 指令微调（SFT）
-
-```bash
-bash scripts/launch/sft.sh
-```
-
-对应配置：`configs/instruct_config.yaml`
-
-- 默认从 `ckpt/vocab_32k_gpt2/` 加载预训练模型
-- 输出到 `ckpt/vocab_32k_gpt2_instruction`
-
-### 6.3 🧩 DPO 前的 SFT
-
-```bash
-bash scripts/launch/sft4dpo.sh
-```
-
-对应配置：`configs/dpo_instruct_config.yaml`
-
-- 默认从 `ckpt/vocab_32k_gpt2_instruction/checkpoint_epoch4` 继续训练
-- 输出到 `ckpt/vocab_32k_gpt2_sft4dpo`
-
-### 6.4 🎯 DPO 训练
-
-```bash
-bash scripts/launch/dpo.sh
-```
-
-等价命令：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-accelerate launch \
-  --config_file configs/accelerate_configs/ds_stage2.yaml \
-  dpo.py
-```
-
-默认输出目录：`ckpt/vocab_32k_gpt2_dpo/`
-
-## 🧷 7. 关键配置说明
-
-### 7.1 📘 训练配置（`configs/*.yaml`）
-
-常用字段：
-
-- `data.mode`: `pretrain` 或 `instruct`
-- `data.seq_length`: 序列长度
-- `train.train_batch_size`: 每进程 batch size
-- `train.gradient_accumulation_steps`: 梯度累积步数
-- `train.num_training_steps`: 总训练步数
-- `train.num_warmup_steps`: warmup 步数
-- `train.lr`: 学习率
-- `work_dir`: checkpoint 存储路径
-
-### 7.2 🖥️ 分布式配置（`configs/accelerate_configs/*.yaml`）
-
-可选：
-
-- `ds_stage1.yaml`
-- `ds_stage2.yaml`（脚本默认）
-- `ds_stage3.yaml`
-- `ds_stage3_offload.yaml`
-
-显存不足时可尝试 `stage3` 或 `stage3_offload`。
-
-## 💾 8. 日志、保存与断点续训
-
-`trainer.py` 中：
-
-- 每隔 `save_interval` 自动保存到 `work_dir/checkpoint_epochX`
-- 启动时会尝试从 `work_dir` 自动恢复 `accelerator` 状态
-- 使用 Weights & Biases 记录日志，默认 `WANDB_MODE=offline`
-
-注意：`trainer.py` 当前写死了 `WANDB_API_KEY` 与 `offline` 模式。如果你需要线上同步，请按需修改环境变量设置。
-
-## 🧪 9. 推理与快速测试
-
-### 9.1 🧱 基座模型测试
-
-```bash
-python scripts/eval/test_base_ckpt.py
-```
-
-### 9.2 🗣️ SFT 模型测试
-
-```bash
-python scripts/eval/test_sft_ckpt.py
-```
-
-两者都会读取 `dataset/validation.py` 中的提示词并打印生成结果。
-
-## ✅ 10. 可复现建议
-
-- 固定随机种子（项目中已对部分流程设置 `seed`）
-- 记录每次实验配置副本（建议保存一份 `configs/*.yaml`）
-- 记录 GPU 数量、显存、CUDA 与依赖版本
-
-## 🙏 11. 致谢
-
-本项目部分实现参考了 Open-Llama/Hugging Face 生态工具链（Transformers、Accelerate、DeepSpeed、Datasets、TRL）。
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+| :--- | :--- |
+| `AssertionError: No files matched the data pattern` | A glob in `data.data` matches nothing. Patterns are resolved relative to the repository root. |
+| CUDA out of memory | Lower `train_batch_size`, raise `gradient_accumulation_steps`, enable `gradient_checkpointing_enable`, or move to `ds_stage3.yaml` / `ds_stage3_offload.yaml`. |
+| Training restarts from step 0 unexpectedly | `work_dir` contains no resumable state; see the checkpointing caveat above. |
+| `ValueError: Unrecognised pretraining record` | The corpus does not expose a `text` field. Add a branch to `pretrain_transform`. |
+| Loss ignores most of an SFT example | Expected: prompt tokens are masked to `-100`, so only the response contributes. |
+| ZeRO-3 saves less memory than expected | Parameter partitioning only applies to models built inside `deepspeed.zero.Init()`, which the `Auto*` classes enter automatically. `train.py` instantiates the model class directly, so register the architecture with `AutoModelForCausalLM` first. See [accelerate#932](https://github.com/huggingface/accelerate/pull/932). |
+| Port already in use during launch | Two runs share `main_process_port`. Change it in the accelerate config. |
+| Throughput collapses on a multi-node host | Try the commented `NCCL_*` overrides at the top of the launch scripts. |
+
+---
+
+## Reproducibility
+
+- Seeds are fixed at 42 for data shuffling (`dataset/dataset.py`) and DPO (`--seed`).
+- Archive the exact `configs/*.yaml` used for each run alongside its checkpoint.
+- Record GPU model and count, VRAM, CUDA version and the resolved package versions
+  (`pip freeze`); `accelerate`/`deepspeed` are pinned in `requirements.txt` because their
+  checkpoint formats have historically shifted between releases.
+- Streaming shuffles depend on shard order and world size, so exact batch-level
+  reproducibility requires an identical device count.
+
+---
+
+## Acknowledgements
+
+The training loop and data pipeline started from [Open-Llama](https://github.com/Bayes-Song/Open-Llama);
+the model, configuration and tokenizer classes are adapted from
+[Hugging Face Transformers](https://github.com/huggingface/transformers) (GPT-2, LLaMA and
+T5 tokenization). Distributed training builds on
+[Accelerate](https://github.com/huggingface/accelerate),
+[DeepSpeed](https://github.com/microsoft/DeepSpeed),
+[Datasets](https://github.com/huggingface/datasets) and
+[TRL](https://github.com/huggingface/trl).
+
+Originally developed as an undergraduate capstone project.
+
+## License
+
+Released under the [Apache License 2.0](LICENSE).

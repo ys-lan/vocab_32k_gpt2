@@ -1,13 +1,40 @@
+"""Minimal JSONL iterable dataset used by the legacy data path.
+
+The active pipeline lives in :mod:`dataset.dataset` and streams through
+`datasets`. This module is kept for shard-level experiments where a plain,
+dependency-free reader is easier to reason about.
+"""
+
 import json
 from glob import glob
+
 from torch.utils.data import IterableDataset
 
 
 class DataIter(IterableDataset):
-    """
-    Currently, the allowed storage formats are jsonl.zst.
-    Each line of the data is a dictionary, which can be parsed as JSON for subsequent processing after reading.
-    Currently, only single worker is supported.
+    """Iterate over sharded JSONL files, optionally packing documents together.
+
+    Every line of a shard must be a JSON object. A ``dataset`` key holding the
+    shard's dataset name is injected into each record before it reaches the
+    transform, which lets a single iterator mix corpora with different schemas.
+
+    Shards are named ``part-<dataset_name>-<index>.jsonl`` and are assigned to
+    ranks round-robin, so each rank sees a disjoint subset of the data.
+
+    Note:
+        Only a single dataloader worker is supported; use ``num_workers=0``.
+
+    Args:
+        paths_with_index: ``(index, path)`` pairs, as built by
+            :func:`create_shard_kwargs`.
+        transform_dict: Per-dataset callables applied to each record. A transform
+            may return ``None`` to drop the record, a string, or a list of token
+            lists.
+        max_length: Sequence length used when ``concat_docs`` is enabled.
+        concat_docs: Concatenate consecutive documents and emit fixed-length
+            ``max_length`` sequences instead of one example per document.
+        process_index: Rank of the current process.
+        num_processes: Total number of processes.
     """
 
     def __init__(
@@ -32,20 +59,17 @@ class DataIter(IterableDataset):
     def __iter__(self):
         past = None
         for i, path in self.paths_with_index:
-            # part-dataset_name-01.jsonl.zst
             dataset_name = path.split("-")[-2]
-            # shard to multiple device
             if self.num_processes > 1 and i % self.num_processes != self.process_index:
                 continue
-            # Log the file name when encountering a new file.
+            # Log once per file so progress is visible without spamming.
             if past != dataset_name:
-                print("Loading data from {}".format(path))
+                print(f"Loading data from {path}")
                 past = path
-            # Currently, the allowed storage formats are jsonl.zst.
-            assert path.endswith(".jsonl")
-            with open(path, "r", encoding="utf-8") as fp:
+            assert path.endswith(".jsonl"), f"Unsupported shard format: {path}"
+            with open(path, encoding="utf-8") as fp:
                 for line in fp:
-                    # If the length of the cache is greater than max_length.
+                    # Flush a full-length sequence before reading more documents.
                     if self.concat_docs and len(self.cache) >= self.max_length:
                         seq = self.cache[: self.max_length]
                         self.cache = self.cache[self.max_length :]
@@ -54,41 +78,41 @@ class DataIter(IterableDataset):
                         line = line.decode("utf-8")
                     line = json.loads(line)
                     line["dataset"] = dataset_name
-                    # Transformation, including sample, tokenize, etc.
-                    if self.transform_dict:
-                        try:
-                            line = self.transform_dict[dataset_name](line)
-                        except BaseException as e:
-                            print(line) 
-                            print('Failed key: ' + str(e))
-                            line = None
-                        # skip bad doc
-                        if line is None:
-                            continue
-                        elif isinstance(line, str):
-                            yield line
-                        # must be list of list
-                        elif isinstance(line, list) and isinstance(line[0], list):
-                            for seq in line:
-                                if self.concat_docs:
-                                    # concat seq from multiple docs
-                                    self.cache += seq
-                                else:
-                                    yield seq
-                        else:
-                            raise Exception(
-                                "Unsupported type in Transformation: {}".format(
-                                    self.transform_dict[dataset_name]
-                                )
-                            )
-                    else:
+                    if not self.transform_dict:
                         yield line
+                        continue
+                    # Transformation, including sampling, tokenization, etc.
+                    try:
+                        line = self.transform_dict[dataset_name](line)
+                    except BaseException as e:
+                        print(line)
+                        print("Failed key: " + str(e))
+                        line = None
+                    if line is None:
+                        continue
+                    elif isinstance(line, str):
+                        yield line
+                    elif isinstance(line, list) and isinstance(line[0], list):
+                        for seq in line:
+                            if self.concat_docs:
+                                self.cache += seq
+                            else:
+                                yield seq
+                    else:
+                        raise Exception(
+                            f"Unsupported type in Transformation: {self.transform_dict[dataset_name]}"
+                        )
 
 
 def create_shard_kwargs(patterns, repeat=1):
-    """
-    Assign numbers to different shards of data to ensure that data is not duplicated
-    when allocated to different nodes during distributed training.
+    """Enumerate shards so that distributed ranks never read the same file.
+
+    Args:
+        patterns: Glob patterns matching the shard files.
+        repeat: Number of times the shard list is repeated, i.e. epochs.
+
+    Returns:
+        A list of ``(index, path)`` pairs consumable by :class:`DataIter`.
     """
     all_path = []
     for p in patterns:
@@ -98,7 +122,7 @@ def create_shard_kwargs(patterns, repeat=1):
 
 
 if __name__ == "__main__":
-    patterns = ["./data/pretrain_datga/*.jsonl.zst"]
+    patterns = ["./data/pretrain_data/*.jsonl"]
     paths = create_shard_kwargs(patterns)
     transform_dict = {"wudao": lambda x: x["title"], "pile": lambda x: [x["text"]]}
     data_iter = DataIter(

@@ -1,0 +1,31 @@
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "dataset/legacy",
+    "models/modeling_vocab_32k_gpt2.py",
+    "models/tokenization_vocab_32k_gpt2.py",
+    "models/configuration_vocab_32k_gpt2.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = [
+    "E501",
+    # The model, config and tokenizer classes intentionally mirror the
+    # `vocab_32k_gpt2*` naming used by the checkpoints on disk.
+    "N801",
+    "N802",
+    # `HfArgumentParser` resolves dataclass fields via `typing.Optional`; PEP 604
+    # unions are not handled by every supported transformers release.
+    "UP007",
+    "UP045",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dataset", "models", "utils"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+extend-exclude = "dataset/legacy|models/(modeling|tokenization|configuration)_vocab_32k_gpt2\\.py"

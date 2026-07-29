@@ -1,18 +1,35 @@
-import torch
-import time
-import os
-import wandb
+"""Training loop with distributed checkpointing, logging and periodic sampling."""
+
 import logging
-from torchinfo import summary
+import os
+import time
+
+import torch
+import wandb
 from deepspeed.ops.adam import FusedAdam
+from torchinfo import summary
 from transformers import get_cosine_schedule_with_warmup
 
 from dataset.validation import val_set_pretrain
 
-os.environ["WANDB_API_KEY"] = "d567cc8410bf55e544b5605cc13a300c607c77b1"
-os.environ["WANDB_MODE"] = "offline"
+logger = logging.getLogger(__name__)
+
+# Default to offline logging so that training never blocks on network access.
+# Export WANDB_MODE=online (and WANDB_API_KEY) to stream metrics to the cloud.
+os.environ.setdefault("WANDB_MODE", "offline")
+
 
 class Trainer:
+    """Drives a single training run on top of an :class:`~accelerate.Accelerator`.
+
+    Args:
+        config: Parsed training config (see ``configs/*.yaml``).
+        raw_model: Unwrapped model, prior to ``accelerator.prepare``.
+        train_loader: Dataloader yielding ``input_ids``/``labels``/``attention_mask``.
+        tokenizer: Tokenizer used for decoding validation samples.
+        accelerator: Configured accelerator handling distribution and precision.
+    """
+
     def __init__(self, config, raw_model, train_loader, tokenizer, accelerator):
         self.config = config
         self.raw_model = raw_model
@@ -23,9 +40,13 @@ class Trainer:
         self.gradient_accumulation_steps = config["train"].get(
             "gradient_accumulation_steps", 1
         )
+        # Schedulers are stepped once per process per micro-batch, so warmup and
+        # total step counts have to be rescaled to stay in "global step" units.
         self.lr_scheduler_factor = (
             accelerator.num_processes / accelerator.gradient_accumulation_steps
         )
+        # Intervals in the config are expressed in optimizer steps; convert them
+        # to micro-batch counts, which is what the training loop counts.
         self.log_interval = (
             self.config["log_interval"] * accelerator.gradient_accumulation_steps
         )
@@ -36,14 +57,12 @@ class Trainer:
             self.config["save_interval"] * accelerator.gradient_accumulation_steps
         )
         self.work_dir = self.config["work_dir"]
-        #self.ckpt_dir = self.config["ckpt_dir"]
-        #self.is_stage3 = self.config["train"]["is_stage3"]
-        #self.need_ckpt = self.config["train"]["need_ckpt"]
-        # self.get_model_info()
+
         if accelerator.is_main_process:
             wandb.init(project=self.config["project_name"])
 
     def get_model_info(self):
+        """Print a layer-by-layer summary of the model (debugging helper)."""
         with torch.no_grad():
             summary(
                 self.raw_model.cuda(),
@@ -51,6 +70,7 @@ class Trainer:
             )
 
     def get_optimizer(self):
+        """Build a FusedAdam optimizer, excluding biases and norms from weight decay."""
         no_decay = ["bias", "LayerNorm.weight", "layernorm.weight"]
         if self.config["train"].get("use_lora", False):
             optimizer_grouped_parameters = self.raw_model.parameters()
@@ -80,6 +100,7 @@ class Trainer:
         )
 
     def get_lr_scheduler(self):
+        """Build a cosine schedule with linear warmup."""
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optim,
             num_warmup_steps=self.config["train"]["num_warmup_steps"]
@@ -89,6 +110,7 @@ class Trainer:
         )
 
     def prepare(self):
+        """Wrap objects for distributed training and resume from ``work_dir`` if possible."""
         (
             _,
             self.model,
@@ -103,13 +125,15 @@ class Trainer:
             self.accelerator.load_state(self.work_dir)
             self.global_step = self.scheduler.scheduler._step_count - 1
             self.global_step = self.global_step // self.accelerator.num_processes
-            logging.warning("Restored ckpt from {}".format(self.work_dir))
-        except:
-            logging.warning("No ckpt found in {}".format(self.work_dir))
+            logger.info("Restored training state from %s", self.work_dir)
+        except Exception:  # noqa: BLE001 - absence of a checkpoint is not fatal.
+            logger.info("No checkpoint found in %s, starting from scratch.", self.work_dir)
         if self.global_step > 0:
             skip_steps = self.global_step * self.gradient_accumulation_steps
-            logging.warning("Skiped {} steps.".format(skip_steps))
-            self.train_loader_skiped = self.accelerator.skip_first_batches(self.train_loader, num_batches=skip_steps)
+            logger.info("Fast-forwarding the dataloader by %d batches.", skip_steps)
+            self.train_loader_skiped = self.accelerator.skip_first_batches(
+                self.train_loader, num_batches=skip_steps
+            )
         else:
             self.train_loader_skiped = self.train_loader
         self.accelerator.wait_for_everyone()
@@ -135,43 +159,42 @@ class Trainer:
         while True:
             if self.data_step >= self.config["train"]["num_training_steps"]:
                 break
+            # Only the resumed epoch needs to skip already-consumed batches.
             if self.epoch == 0:
                 train_loader = self.train_loader_skiped
             else:
                 train_loader = self.train_loader
 
             for batch in train_loader:
-                # end training
                 if self.data_step >= self.config["train"]["num_training_steps"]:
                     break
-                # data to device
                 for k, v in batch.items():
                     batch[k] = v.to(self.accelerator.device, non_blocking=True)
                 self.model.train()
-                # train step
                 with self.accelerator.accumulate(self.model):
                     losses = self.train_step(batch)
                     if self.accelerator.sync_gradients:
                         self.global_step += 1
 
-                # log
                 if (
                     self.data_step % self.log_interval == 0
                     and self.data_step > 0
                     and self.accelerator.is_main_process
                 ):
                     self.log(losses)
-                # eval/vis model output
                 if (
                     self.data_step % self.eval_interval == 0
                     and self.accelerator.is_main_process
                     and self.train_and_eval
                 ):
                     self.eval()
-                # save state
+
+                # All ranks must reach the barrier before a collective save.
                 self.accelerator.wait_for_everyone()
                 if self.data_step % self.save_interval == 0 and self.data_step > 0:
-                    self.accelerator.save_state(os.path.join(self.work_dir, 'checkpoint_epoch{}'.format(self.epoch)))
+                    self.accelerator.save_state(
+                        os.path.join(self.work_dir, f"checkpoint_epoch{self.epoch}")
+                    )
                 self.data_step += 1
             self.epoch += 1
         wandb.finish()
@@ -186,7 +209,7 @@ class Trainer:
         )
         wandb.log({"Training/Token per second per gpu": tokens / cost_time})
         for k, v in losses.items():
-            wandb.log({"Losses/{}".format(k): v})
+            wandb.log({f"Losses/{k}": v})
         current_lr = self.optim.param_groups[0]["lr"]
         wandb.log({"Training/LR": current_lr})
         if self.optim.scaler is not None:
@@ -195,21 +218,18 @@ class Trainer:
         wandb.log({"Training/Global Step": self.global_step})
         wandb.log({"Training/Epoch": self.epoch})
         self.accelerator.print(
-            "Epoch: {}, Global Step: {}, Data Step: {}, Loss: {}, Token per second per gpu: {}".format(
-                self.epoch,
-                self.global_step,
-                self.data_step,
-                losses["total_loss"],
-                tokens / cost_time,
-            )
+            f"Epoch: {self.epoch}, Global Step: {self.global_step}, "
+            f"Data Step: {self.data_step}, LR: {current_lr:.3e}, "
+            f"Loss: {losses['total_loss']:.4f}, "
+            f"Tokens/s/GPU: {tokens / cost_time:.0f}"
         )
 
     def eval(self):
+        """Sample completions for the validation prompts and log them to W&B."""
         text_table = wandb.Table(columns=["question", "pred"])
         self.model.eval()
         with torch.no_grad():
-            for data in val_set_pretrain:
-                raw_inputs = data
+            for raw_inputs in val_set_pretrain:
                 inputs = self.tokenizer(
                     raw_inputs,
                     return_tensors="pt",
@@ -227,5 +247,5 @@ class Trainer:
                 pred = pred[0, input_length:]
                 pred = self.tokenizer.decode(pred.cpu(), skip_special_tokens=True)
                 text_table.add_data(raw_inputs, pred)
-                print(raw_inputs, '\n', pred, '\n')
-        wandb.log({"Predictions on {}".format(self.global_step): text_table})
+                print(raw_inputs, "\n", pred, "\n")
+        wandb.log({f"Predictions on {self.global_step}": text_table})
